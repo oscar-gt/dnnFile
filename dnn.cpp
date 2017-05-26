@@ -45,7 +45,6 @@
 #include <iostream>
 #include <sstream>
 #include <iterator>
-#include <opencv2/dnn/shape_utils.hpp>
 
 using namespace cv;
 using namespace cv::dnn;
@@ -67,65 +66,6 @@ static String toString(const T &v)
     ss << v;
     return ss.str();
 }
-
-Mat blobFromImage(const Mat& image_, double scalefactor, bool swapRB)
-{
-    Mat image;
-    if(image_.depth() == CV_8U)
-    {
-        image_.convertTo(image, CV_32F, scalefactor);
-    }
-    else
-        image = image_;
-    CV_Assert(image.dims == 2 && image.depth() == CV_32F);
-    int nch = image.channels();
-    CV_Assert(nch == 3 || nch == 4);
-    int sz[] = { 1, 3, image.rows, image.cols };
-    Mat blob(4, sz, CV_32F);
-    Mat ch[4];
-    for( int j = 0; j < 3; j++ )
-        ch[j] = Mat(image.rows, image.cols, CV_32F, blob.ptr(0, j));
-    if(swapRB)
-        std::swap(ch[0], ch[2]);
-    split(image, ch);
-    return blob;
-}
-
-Mat blobFromImages(const std::vector<Mat>& images, double scalefactor, bool swapRB)
-{
-    size_t i, nimages = images.size();
-    if(nimages == 0)
-        return Mat();
-    Mat image0 = images[0];
-    int nch = image0.channels();
-    CV_Assert(image0.dims == 2 && (nch == 3 || nch == 4));
-    int sz[] = { (int)nimages, 3, image0.rows, image0.cols };
-    Mat blob(4, sz, CV_32F), image;
-    Mat ch[4];
-
-    for( i = 0; i < nimages; i++ )
-    {
-        Mat image_ = images[i];
-        if(image_.depth() == CV_8U)
-        {
-            image_.convertTo(image, CV_32F, scalefactor);
-        }
-        else
-            image = image_;
-        CV_Assert(image.depth() == CV_32F);
-        nch = image.channels();
-        CV_Assert(image.dims == 2 && (nch == 3 || nch == 4));
-        CV_Assert(image.size() == image0.size());
-
-        for( int j = 0; j < 3; j++ )
-            ch[j] = Mat(image.rows, image.cols, CV_32F, blob.ptr((int)i, j));
-        if(swapRB)
-            std::swap(ch[0], ch[2]);
-        split(image, ch);
-    }
-    return blob;
-}
-
 
 struct LayerPin
 {
@@ -167,9 +107,8 @@ struct LayerData
     std::set<int> requiredOutputs;
 
     Ptr<Layer> layerInstance;
-    std::vector<Mat> outputBlobs;
-    std::vector<Mat*> inputBlobs;
-    std::vector<Mat> internals;
+    std::vector<Blob> outputBlobs;
+    std::vector<Blob*> inputBlobs;
 
     int flag;
 
@@ -191,8 +130,8 @@ struct LayerData
 //fake layer containing network input blobs
 struct DataLayer : public Layer
 {
-    void finalize(const std::vector<Mat*>&, std::vector<Mat>&) {}
-    void forward(std::vector<Mat*>&, std::vector<Mat>&, std::vector<Mat> &) {}
+    void allocate(const std::vector<Blob*>&, std::vector<Blob>&) {}
+    void forward(std::vector<Blob*>&, std::vector<Blob>&) {}
 
     int outputNameToIndex(String tgtName)
     {
@@ -211,17 +150,6 @@ private:
 
 struct Net::Impl
 {
-    typedef std::vector<MatShape> ShapesVec;
-    struct LayerShapes
-    {
-        ShapesVec in, out, internal;
-        bool inplace;
-        LayerShapes() {inplace = false;}
-    };
-
-    typedef std::map<int, LayerShapes> LayersShapesMap;
-    typedef std::map<int, LayerData> MapIdToLayerData;
-
     Impl()
     {
         //allocate fake net input layer
@@ -240,7 +168,8 @@ struct Net::Impl
     Ptr<DataLayer> netInputLayer;
     std::vector<int> netOutputs;
 
-    MapIdToLayerData layers;
+    typedef std::map<int, LayerData> MapIdToLayerData;
+    std::map<int, LayerData> layers;
     std::map<String, int> layerNameToId;
 
     int lastLayerId;
@@ -411,7 +340,7 @@ struct Net::Impl
     #define CV_RETHROW_ERROR(err, newmsg)\
         cv::error(err.code, newmsg, err.func.c_str(), err.file.c_str(), err.line)
 
-    void allocateLayer(int lid, const LayersShapesMap& layersShapes)
+    void allocateLayer(int lid)
     {
         LayerData &ld = layers[lid];
 
@@ -419,35 +348,17 @@ struct Net::Impl
         if (ld.flag)
             return;
 
-        size_t ninputs = ld.inputBlobsId.size();
-#if 0
-        printf("layer %s:", ld.name.c_str());
-        for (size_t i = 0; i < ninputs; i++)
-        {
-            int inp_lid = ld.inputBlobsId[i].lid;
-            LayerData &inp_ld = layers[inp_lid];
-            int inp_outputs = (int)inp_ld.outputBlobs.size();
-            std::cout << " " << inp_ld.name << "(" << inp_outputs;
-            for( int j = 0; j < inp_outputs; j++ )
-            {
-                std::cout << (j == 0 ? ": " : ", ") << inp_ld.outputBlobs[j].size;
-            }
-            std::cout << ")";
-        }
-        printf("\n");
-#endif
-
         //determine parent layers
-        for (size_t i = 0; i < ninputs; i++)
+        for (size_t i = 0; i < ld.inputBlobsId.size(); i++)
             ld.inputLayersId.insert(ld.inputBlobsId[i].lid);
 
         //allocate parents
         for (set<int>::iterator i = ld.inputLayersId.begin(); i != ld.inputLayersId.end(); i++)
-            allocateLayer(*i, layersShapes);
+            allocateLayer(*i);
 
         //bind inputs
-        ld.inputBlobs.resize(ninputs);
-        for (size_t i = 0; i < ninputs; i++)
+        ld.inputBlobs.resize(ld.inputBlobsId.size());
+        for (size_t i = 0; i < ld.inputBlobsId.size(); i++)
         {
             LayerPin from = ld.inputBlobsId[i];
             CV_Assert(from.valid());
@@ -455,56 +366,17 @@ struct Net::Impl
             ld.inputBlobs[i] = &layers[from.lid].outputBlobs[from.oid];
         }
 
-        LayersShapesMap::const_iterator layerShapesIt = layersShapes.find(lid);
-
-        CV_Assert(layerShapesIt != layersShapes.end());
-        const ShapesVec& outShapes = layerShapesIt->second.out;
-        CV_Assert(ld.requiredOutputs.size() <= outShapes.size());
-
-        ld.outputBlobs.resize(std::max((size_t)1, outShapes.size())); //layer produce at least one output blob
-        for(int i = 0; i < outShapes.size(); i++)
+        //allocate layer
+        ld.outputBlobs.resize(std::max((size_t)1, ld.requiredOutputs.size())); //layer produce at least one output blob
+        try
         {
-            if (shape(ld.outputBlobs[i]) != outShapes[i])
-            {
-                if (layerShapesIt->second.inplace)
-                {
-                    CV_Assert(ld.inputBlobs.size() == ld.outputBlobs.size());
-                    CV_Assert(ld.inputBlobs[i]->total() == total(outShapes[i]));
-                    ld.outputBlobs[i] = ld.inputBlobs[i]->reshape(1, outShapes[i]);
-                }
-                else
-                {
-                    ld.outputBlobs[i].create(outShapes[i], CV_32F);
-                }
-            }
+            Ptr<Layer> layerPtr = ld.getLayerInstance();
+            layerPtr->allocate(ld.inputBlobs, ld.outputBlobs);
         }
-
-        const ShapesVec& intShapes = layerShapesIt->second.internal;
-        ld.internals.resize(intShapes.size());
-        for(int i = 0; i < intShapes.size(); i++)
-        {
-            if (shape(ld.internals[i]) != intShapes[i] && total(intShapes[i]))
-                ld.internals[i].create(intShapes[i], CV_32F);
-        }
-
-        Ptr<Layer> layerPtr = ld.getLayerInstance();
-        //try
-        {
-            layerPtr->finalize(ld.inputBlobs, ld.outputBlobs);
-#if 0
-            std::cout << "\toutputs:";
-            size_t noutputs = ld.outputBlobs.size();
-            for (size_t j = 0; j < noutputs; j++)
-            {
-                std::cout << (j == 0 ? " " : ", ") << ld.outputBlobs[j].size;
-            }
-            std::cout << "\n";
-#endif
-        }
-        /*catch (const cv::Exception &err)
+        catch (const cv::Exception &err)
         {
             CV_RETHROW_ERROR(err, format("The following error occured while making allocate() for layer \"%s\": %s", ld.name.c_str(), err.err.c_str()));
-        }*/
+        }
 
         ld.flag = 1;
     }
@@ -515,20 +387,10 @@ struct Net::Impl
         for (it = layers.begin(); it != layers.end(); it++)
             it->second.flag = 0;
 
-        CV_Assert(!layers[0].outputBlobs.empty());
-        ShapesVec inputShapes;
-        for(int i = 0; i < layers[0].outputBlobs.size(); i++)
-        {
-            CV_Assert(layers[0].outputBlobs[i].total());
-            inputShapes.push_back(shape(layers[0].outputBlobs[i]));
-        }
-        LayersShapesMap layersShapes;
-        getLayersShapes(inputShapes, layersShapes);
-
         for (it = layers.begin(); it != layers.end(); it++)
         {
             int lid = it->first;
-            allocateLayer(lid, layersShapes);
+            allocateLayer(lid);
         }
     }
 
@@ -552,14 +414,14 @@ struct Net::Impl
         }
 
         //forward itself
-        //try
+        try
         {
-            ld.layerInstance->forward(ld.inputBlobs, ld.outputBlobs, ld.internals);
+            ld.layerInstance->forward(ld.inputBlobs, ld.outputBlobs);
         }
-        /*catch (const cv::Exception &err)
+        catch (const cv::Exception &err)
         {
             CV_RETHROW_ERROR(err, format("The following error occured while making forward() for layer \"%s\": %s", ld.name.c_str(), err.err.c_str()));
-        }*/
+        }
 
         ld.flag = 1;
     }
@@ -572,57 +434,6 @@ struct Net::Impl
 
         for (it = layers.begin(); it != layers.end(); it++)
             forwardLayer(it->second, false);
-    }
-
-    void getLayerShapesRecursively(int id, LayersShapesMap& inOutShapes)
-    {
-        std::vector<LayerPin>& inputLayerIds = layers[id].inputBlobsId;
-
-        if (inOutShapes[id].in.empty())
-        {
-            for(int i = 0; i < inputLayerIds.size(); i++)
-            {
-                int layerId = inputLayerIds[i].lid;
-                LayersShapesMap::iterator it =
-                        inOutShapes.find(layerId);
-                if(it == inOutShapes.end() ||
-                        it->second.out.empty())
-                {
-                    getLayerShapesRecursively(layerId, inOutShapes);
-                }
-                const MatShape& shape = inOutShapes[layerId].out[inputLayerIds[i].oid];
-                inOutShapes[id].in.push_back(shape);
-            }
-        }
-        const ShapesVec& is = inOutShapes[id].in;
-        ShapesVec& os = inOutShapes[id].out;
-        ShapesVec& ints = inOutShapes[id].internal;
-        int requiredOutputs = layers[id].requiredOutputs.size();
-        inOutShapes[id].inplace =
-                layers[id].getLayerInstance()->getMemoryShapes(is, requiredOutputs, os, ints);
-    }
-
-    void getLayersShapes(const ShapesVec& netInputShapes,
-                         LayersShapesMap& inOutShapes)
-    {
-        inOutShapes.clear();
-
-        inOutShapes[0].in = netInputShapes; //insert shape for first input layer
-        for (MapIdToLayerData::iterator it = layers.begin();
-             it != layers.end(); it++)
-        {
-            getLayerShapesRecursively(it->first, inOutShapes);
-        }
-    }
-
-    void getLayerShapes(const ShapesVec& netInputShapes,
-                        const int layerId,
-                        LayerShapes& shapes)
-    {
-        LayersShapesMap inOutShapes;
-        inOutShapes[0].in = netInputShapes; //insert shape for first input layer
-        getLayerShapesRecursively(layerId, inOutShapes);
-        shapes = inOutShapes[layerId];
     }
 };
 
@@ -698,7 +509,7 @@ void Net::setNetInputs(const std::vector<String> &inputBlobNames)
     impl->netInputLayer->setNames(inputBlobNames);
 }
 
-void Net::setBlob(String outputName, const Mat &blob_)
+void Net::setBlob(String outputName, const Blob &blob)
 {
     LayerPin pin = impl->getPinByAlias(outputName);
     if (!pin.valid())
@@ -706,13 +517,10 @@ void Net::setBlob(String outputName, const Mat &blob_)
 
     LayerData &ld = impl->layers[pin.lid];
     ld.outputBlobs.resize( std::max(pin.oid+1, (int)ld.requiredOutputs.size()) );
-    MatShape prevShape = shape(ld.outputBlobs[pin.oid]);
-    ld.outputBlobs[pin.oid] = blob_.clone();
-
-    impl->netWasAllocated = impl->netWasAllocated && prevShape == shape(blob_);
+    ld.outputBlobs[pin.oid] = blob;
 }
 
-Mat Net::getBlob(String outputName)
+Blob Net::getBlob(String outputName)
 {
     LayerPin pin = impl->getPinByAlias(outputName);
     if (!pin.valid())
@@ -727,20 +535,20 @@ Mat Net::getBlob(String outputName)
     return ld.outputBlobs[pin.oid];
 }
 
-Mat Net::getParam(LayerId layer, int numParam)
+Blob Net::getParam(LayerId layer, int numParam)
 {
     LayerData &ld = impl->getLayerData(layer);
 
-    std::vector<Mat> &layerBlobs = ld.layerInstance->blobs;
+    std::vector<Blob> &layerBlobs = ld.layerInstance->blobs;
     CV_Assert(numParam < (int)layerBlobs.size());
     return layerBlobs[numParam];
 }
 
-void Net::setParam(LayerId layer, int numParam, const Mat &blob)
+void Net::setParam(LayerId layer, int numParam, const Blob &blob)
 {
     LayerData &ld = impl->getLayerData(layer);
 
-    std::vector<Mat> &layerBlobs = ld.layerInstance->blobs;
+    std::vector<Blob> &layerBlobs = ld.layerInstance->blobs;
     CV_Assert(numParam < (int)layerBlobs.size());
     //we don't make strong checks, use this function carefully
     layerBlobs[numParam] = blob;
@@ -760,23 +568,8 @@ Ptr<Layer> Net::getLayer(LayerId layerId)
 {
     LayerData &ld = impl->getLayerData(layerId);
     if (!ld.layerInstance)
-        CV_Error(Error::StsNullPtr, format("Requested layer \"%s\" was not initialized", ld.name.c_str()));
+        CV_Error(Error::StsNullPtr, format("Requseted layer \"%s\" was not initialized", ld.name.c_str()));
     return ld.layerInstance;
-}
-
-std::vector<Ptr<Layer> > Net::getLayerInputs(LayerId layerId)
-{
-    LayerData &ld = impl->getLayerData(layerId);
-    if (!ld.layerInstance)
-        CV_Error(Error::StsNullPtr, format("Requested layer \"%s\" was not initialized", ld.name.c_str()));
-
-    std::vector<Ptr<Layer> > inputLayers;
-    inputLayers.reserve(ld.inputLayersId.size());
-    std::set<int>::iterator it;
-    for (it = ld.inputLayersId.begin(); it != ld.inputLayersId.end(); ++it) {
-        inputLayers.push_back(getLayer(*it));
-    }
-    return inputLayers;
 }
 
 std::vector<String> Net::getLayerNames() const
@@ -797,220 +590,6 @@ std::vector<String> Net::getLayerNames() const
 bool Net::empty() const
 {
     return impl->layers.size() <= 1; //first layer is default Data layer
-}
-
-std::vector<int> Net::getUnconnectedOutLayers() const
-{
-    std::vector<int> layersIds;
-
-    Impl::MapIdToLayerData::iterator it;
-    for (it = impl->layers.begin(); it != impl->layers.end(); it++)
-    {
-        int lid = it->first;
-        LayerData &ld = it->second;
-
-        if (ld.requiredOutputs.size() == 0)
-            layersIds.push_back(lid);
-    }
-
-    return layersIds;
-}
-
-void Net::getLayersShapes(const Net::Impl::ShapesVec& netInputShapes,
-                          std::vector<int>* layersIds,
-                          std::vector<Net::Impl::ShapesVec>* inLayersShapes,
-                          std::vector<Net::Impl::ShapesVec>* outLayersShapes) const
-{
-    if ((layersIds || inLayersShapes || outLayersShapes) == false)
-        return;
-
-    if (layersIds) layersIds->clear();
-    if (inLayersShapes) inLayersShapes->clear();
-    if (outLayersShapes) outLayersShapes->clear();
-
-    Impl::LayersShapesMap inOutShapes;
-    impl->getLayersShapes(netInputShapes, inOutShapes);
-
-    for(Impl::LayersShapesMap::const_iterator it = inOutShapes.begin();
-        it != inOutShapes.end(); it++)
-    {
-        if (layersIds)
-            layersIds->push_back(it->first);
-        if (inLayersShapes)
-            inLayersShapes->push_back(it->second.in);
-        if (outLayersShapes)
-            outLayersShapes->push_back(it->second.out);
-    }
-}
-
-void Net::getLayersShapes(const MatShape& netInputShape,
-                          std::vector<int>* layerIds,
-                          std::vector<Net::Impl::ShapesVec>* inLayersShapes,
-                          std::vector<Net::Impl::ShapesVec>* outLayersShapes) const
-{
-    getLayersShapes(Net::Impl::ShapesVec(1, netInputShape),
-                    layerIds, inLayersShapes, outLayersShapes);
-}
-
-void Net::getLayerShapes(const MatShape& netInputShape,
-                         const int layerId,
-                         Net::Impl::ShapesVec* inLayerShapes,
-                         Net::Impl::ShapesVec* outLayerShapes) const
-{
-    getLayerShapes(Net::Impl::ShapesVec(1, netInputShape),
-                   layerId, inLayerShapes, outLayerShapes);
-
-}
-
-void Net::getLayerShapes(const Net::Impl::ShapesVec& netInputShapes,
-                    const int layerId,
-                    Net::Impl::ShapesVec* inLayerShapes,
-                    Net::Impl::ShapesVec* outLayerShapes) const
-{
-    Impl::LayerShapes shapes;
-    impl->getLayerShapes(netInputShapes, layerId, shapes);
-    if (inLayerShapes)
-        *inLayerShapes = shapes.in;
-    if (outLayerShapes)
-        *outLayerShapes = shapes.out;
-}
-
-int64 Net::getFLOPS(const std::vector<MatShape>& netInputShapes) const
-{
-    int64 flops = 0;
-    std::vector<int> ids;
-    std::vector<std::vector<MatShape> > inShapes, outShapes;
-    getLayersShapes(netInputShapes, &ids, &inShapes, &outShapes);
-    CV_Assert(inShapes.size() == outShapes.size());
-    CV_Assert(inShapes.size() == ids.size());
-
-    for(int i = 0; i < ids.size(); i++)
-    {
-        flops += impl->layers[ids[i]].getLayerInstance()->getFLOPS(inShapes[i],
-                                                                   outShapes[i]);
-    }
-
-    return flops;
-}
-
-int64 Net::getFLOPS(const MatShape& netInputShape) const
-{
-    return getFLOPS(std::vector<MatShape>(1, netInputShape));
-}
-
-int64 Net::getFLOPS(const int layerId,
-              const std::vector<MatShape>& netInputShapes) const
-{
-    Impl::MapIdToLayerData::iterator layer = impl->layers.find(layerId);
-    CV_Assert(layer != impl->layers.end());
-
-    Impl::LayerShapes shapes;
-    impl->getLayerShapes(netInputShapes, layerId, shapes);
-
-    return layer->second.getLayerInstance()->getFLOPS(shapes.in, shapes.out);
-}
-
-int64 Net::getFLOPS(const int layerId,
-              const MatShape& netInputShape) const
-{
-    return getFLOPS(layerId, std::vector<MatShape>(1, netInputShape));
-}
-
-void Net::getLayerTypes(std::vector<String>& layersTypes) const
-{
-    layersTypes.clear();
-
-    std::map<String, int> layers;
-    for (Impl::MapIdToLayerData::iterator it = impl->layers.begin();
-         it != impl->layers.end(); it++)
-    {
-        if (layers.find(it->second.type) == layers.end())
-            layers[it->second.type] = 0;
-        layers[it->second.type]++;
-    }
-
-    for (std::map<String, int>::iterator it = layers.begin();
-         it != layers.end(); it++)
-    {
-        layersTypes.push_back(it->first);
-    }
-}
-
-int Net::getLayersCount(const String& layerType) const
-{
-    int count = 0;
-    for (Impl::MapIdToLayerData::iterator it = impl->layers.begin();
-         it != impl->layers.end(); it++)
-    {
-        if (it->second.type == layerType)
-            count++;
-    }
-    return count;
-}
-
-void Net::getMemoryConsumption(const int layerId,
-                               const std::vector<MatShape>& netInputShapes,
-                               size_t& weights, size_t& blobs) const
-{
-    Impl::MapIdToLayerData::iterator layer = impl->layers.find(layerId);
-    CV_Assert(layer != impl->layers.end());
-
-    weights = blobs = 0;
-
-    for(int i = 0; i < layer->second.params.blobs.size(); i++)
-    {
-        const Mat& weightsBlob = layer->second.params.blobs[i];
-        weights += weightsBlob.total()*weightsBlob.elemSize();
-    }
-
-    std::vector<MatShape> outLayerShapes;
-    getLayerShapes(netInputShapes, layerId, 0, &outLayerShapes);
-    for(int i = 0; i < outLayerShapes.size(); i++)
-    {
-        blobs += total(outLayerShapes[i]) * sizeof(float);
-    }
-}
-
-void Net::getMemoryConsumption(const std::vector<MatShape>& netInputShapes,
-                               size_t& weights, size_t& blobs) const
-{
-    std::vector<int> layerIds;
-    std::vector<std::vector<MatShape> > outLayerShapes;
-
-    getLayersShapes(netInputShapes, &layerIds, 0, &outLayerShapes);
-
-    weights = blobs = 0;
-    for(int i = 0; i < layerIds.size(); i++)
-    {
-        Impl::MapIdToLayerData::iterator layer = impl->layers.find(layerIds[i]);
-        CV_Assert(layer != impl->layers.end());
-
-        for(int j = 0; j < layer->second.params.blobs.size(); j++)
-        {
-            const Mat& weightsBlob = layer->second.params.blobs[j];
-            weights += weightsBlob.total()*weightsBlob.elemSize();
-        }
-
-        for(int j = 0; j < outLayerShapes[i].size(); j++)
-        {
-            blobs += total(outLayerShapes[i][j]) * sizeof(float);
-        }
-    }
-}
-
-void Net::getMemoryConsumption(const int layerId,
-                               const MatShape& netInputShape,
-                               size_t& weights, size_t& blobs) const
-{
-    getMemoryConsumption(layerId, std::vector<MatShape>(1, netInputShape),
-                         weights, blobs);
-}
-
-void Net::getMemoryConsumption(const MatShape& netInputShape,
-                               size_t& weights, size_t& blobs) const
-{
-    getMemoryConsumption(std::vector<MatShape>(1, netInputShape),
-                         weights, blobs);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1050,51 +629,36 @@ static void vecToPVec(const std::vector<T> &v, std::vector<T*> &pv)
         pv[i] = const_cast<T*>(&v[i]);
 }
 
-void Layer::finalize(const std::vector<Mat> &inputs, std::vector<Mat> &outputs)
+void Layer::allocate(const std::vector<Blob> &inputs, std::vector<Blob> &outputs)
 {
-    std::vector<Mat*> inputsp;
+    std::vector<Blob*> inputsp;
     vecToPVec(inputs, inputsp);
-    this->finalize(inputsp, outputs);
+    this->allocate(inputsp, outputs);
 }
 
-void Layer::finalize(const std::vector<Mat*> &input, std::vector<Mat> &output)
+std::vector<Blob> Layer::allocate(const std::vector<Blob> &inputs)
 {
-    (void)input;(void)output;
-}
-
-std::vector<Mat> Layer::finalize(const std::vector<Mat> &inputs)
-{
-    std::vector<Mat> outputs;
-    this->finalize(inputs, outputs);
+    std::vector<Blob> outputs;
+    this->allocate(inputs, outputs);
     return outputs;
 }
 
-void Layer::forward(const std::vector<Mat> &inputs, std::vector<Mat> &outputs, std::vector<Mat> &internals)
+void Layer::forward(const std::vector<Blob> &inputs, std::vector<Blob> &outputs)
 {
-    std::vector<Mat*> inputsp;
+    std::vector<Blob*> inputsp;
     vecToPVec(inputs, inputsp);
-    this->forward(inputsp, outputs, internals);
+    this->forward(inputsp, outputs);
 }
 
-void Layer::run(const std::vector<Mat> &inputs, std::vector<Mat> &outputs, std::vector<Mat> &internals)
+void Layer::run(const std::vector<Blob> &inputs, std::vector<Blob> &outputs)
 {
-    std::vector<Mat*> inputsp;
+    std::vector<Blob*> inputsp;
     vecToPVec(inputs, inputsp);
-    this->finalize(inputsp, outputs);
-    this->forward(inputsp, outputs, internals);
+    this->allocate(inputsp, outputs);
+    this->forward(inputsp, outputs);
 }
 
 Layer::~Layer() {}
-
-bool Layer::getMemoryShapes(const std::vector<MatShape> &inputs,
-                            const int requiredOutputs,
-                            std::vector<MatShape> &outputs,
-                            std::vector<MatShape> &internals) const
-{
-    CV_Assert(inputs.size());
-    outputs.assign(std::max(requiredOutputs, (int)inputs.size()), inputs[0]);
-    return false;
-}
 
 //////////////////////////////////////////////////////////////////////////
 
